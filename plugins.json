@@ -1,0 +1,24 @@
+[
+    {
+        "url": "https://raw.githubusercontent.com/Anqqasa/Indflix/builds/VidriftStream.cs3",
+        "status": 1,
+        "version": 1,
+        "name": "VidriftStream",
+        "internalName": "VidriftStream",
+        "authors": [
+            "SinemaKu (fork of Indflix)"
+        ],
+        "description": "VidRift-first fork of IndStream (Indflix) for SinemaKu. Tries VidRift first for every title, then races the remaining independent HLS/DASH servers. Federated embed-server resolver keyed by TMDB/IMDB id, with multi-language audio + per-quality links.",
+        "fileSize": 387637,
+        "repositoryUrl": "https://github.com/Anqqasa/Indflix",
+        "language": "hi",
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Live"
+        ],
+        "iconUrl": "https://raw.githubusercontent.com/Anqqasa/Indflix/main/VidriftStream/icon.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-2569c7b5e033ab5d84e5f3cde56c95b385cffa7cc27e08ec977ea2e06ff6b4d4"
+    }
+]
