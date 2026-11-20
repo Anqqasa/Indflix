@@ -31,8 +31,9 @@ project repository linked beside it.
    Files derived from CSX's `invokeMoviebox` (aoneroom wefeed-h5api-bff
    app API: x-user bearer token, subject search, download/play endpoints,
    fmoviesunblocked playback headers):
-     - IndStream/src/main/kotlin/com/indstream/StreamEngine.kt
-       (the `resolveMovieBox` function)
+     - VidriftStream/src/main/kotlin/com/sinemaku/vidriftstream/StreamEngine.kt
+       (the `resolveMovieBox` function; upstream path was
+       IndStream/src/main/kotlin/com/indstream/StreamEngine.kt)
 
    The x-user token cache and concurrent subject processing in
    `resolveMovieBox` are CSX-inspired structural choices; the

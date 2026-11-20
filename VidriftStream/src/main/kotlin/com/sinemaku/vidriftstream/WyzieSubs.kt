@@ -1,0 +1,241 @@
+package com.sinemaku.vidriftstream
+
+import android.util.Log
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.app
+import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
+
+object WyzieSubs {
+
+    private const val BASE = "https://sub.wyzie.io"
+    private const val TAG = "WyzieSubs"
+
+    const val FETCH_BUDGET_MS = 30_000L
+
+    internal const val SOURCES_BUDGET_MS = 2_500L
+    private const val SOURCES_TTL_MS = 6 * 60 * 60 * 1000L
+    private val sourcesCache = ConcurrentHashMap<String, Pair<Long, List<String>>>()
+
+    internal const val MAX_PER_LANG = 5
+
+    private data class GroupResult(
+        val tracks: List<SubtilesProvider.SubTrack>,
+        val failure: String?,
+        val blank: Boolean,
+    )
+
+    fun buildUrl(
+        imdbId: String?,
+        season: Int,
+        episode: Int,
+        codes: Set<String>,
+        apiKey: String,
+        sources: List<String>? = null,
+    ): String? {
+        val key = apiKey.trim().takeIf { it.isNotEmpty() } ?: return null
+        val id = imdbId?.takeIf { it.startsWith("tt") } ?: return null
+        val out = StringBuilder("$BASE/search?id=${enc(id)}")
+        if (season > 0 && episode > 0) out.append("&season=$season&episode=$episode")
+        val langs = codes.filter { it.isNotBlank() }.distinct().joinToString(",") { enc(it) }
+        if (langs.isNotBlank()) out.append("&language=$langs")
+        out.append(sourceQuery(sources))
+        out.append("&key=${enc(key)}")
+        return out.toString()
+    }
+
+    private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+
+    internal fun sourceQuery(sources: List<String>?): String {
+        val list = sources?.filter { it.isNotBlank() }?.distinct().orEmpty()
+        return if (list.isEmpty()) "" else "&source=" + list.joinToString(",") { enc(it) }
+    }
+
+    suspend fun keySources(apiKey: String, deadline: Long): List<String>? {
+        val key = apiKey.trim().ifEmpty { return null }
+        val now = System.currentTimeMillis()
+        sourcesCache[key]?.let { (exp, list) -> if (now < exp) return list }
+        val (_, text) = HttpKit.attempt { get("$BASE/sources?key=${enc(key)}", deadline) }
+            ?: return null
+        val list = parseSources(text).takeIf { it.isNotEmpty() } ?: return null
+        sourcesCache[key] = (System.currentTimeMillis() + SOURCES_TTL_MS) to list
+        return list
+    }
+
+    internal fun parseSources(text: String?): List<String> {
+        val o = text?.trim()?.takeIf { it.startsWith("{") }
+            ?.let { runCatching { org.json.JSONObject(it) }.getOrNull() } ?: return emptyList()
+        o.optJSONArray("available")?.let { arr ->
+            val out = (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+            if (out.isNotEmpty()) return out
+        }
+        if (!o.optBoolean("allFree", false)) return emptyList()
+        val arr = o.optJSONArray("sources") ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+    }
+
+    internal fun parse(text: String, wantCodes: Set<String>): List<SubtilesProvider.SubTrack> {
+        val arr = runCatching {
+            val t = text.trim()
+            when {
+                t.startsWith("[") -> org.json.JSONArray(t)
+                t.startsWith("{") -> {
+                    val o = org.json.JSONObject(t)
+                    o.optJSONArray("subtitles") ?: org.json.JSONArray().put(o)
+                }
+                else -> null
+            }
+        }.getOrNull() ?: return emptyList()
+        val perLang = HashMap<String, Int>()
+        val seenUrls = HashSet<String>()
+        val out = mutableListOf<SubtilesProvider.SubTrack>()
+        for (i in 0 until arr.length()) {
+            val s = arr.optJSONObject(i) ?: continue
+            val url = s.optString("url").takeIf { it.startsWith("http") && seenUrls.add(it) }
+                ?: continue
+            val raw = s.optString("language").ifBlank { s.optString("lang") }
+            if (raw.isBlank()) continue
+            val canon = LinkNaming.canonicalSubtitleName(raw)
+            val code = raw.lowercase()
+            val code1 = SubtilesProvider.codeForLang(canon) ?: code.take(2)
+            if (code1 !in wantCodes && code !in wantCodes && canon.lowercase() !in wantCodes) continue
+            if ((perLang[canon] ?: 0) >= MAX_PER_LANG) continue
+            perLang[canon] = (perLang[canon] ?: 0) + 1
+            out.add(SubtilesProvider.SubTrack(canon, url, LinkNaming.subtitleMenuName(canon, raw)))
+        }
+        return out
+    }
+
+    internal fun failureReason(code: Int?, text: String?): String? {
+        if (text?.contains("no subtitles found", ignoreCase = true) == true) return null
+        if (code == 401) return "key rejected"
+        if (code == 429 || code == 402) return "limit reached"
+        if (code != null && code !in 200..299) {
+            val reason = bodyReason(text)
+            if (reason != null && reason != "server error") return reason
+            return if (code == 400) "request rejected" else "server error ($code)"
+        }
+        if (text.isNullOrBlank()) return null
+        return bodyReason(text)
+    }
+
+    private fun bodyReason(text: String?): String? {
+        if (text.isNullOrBlank()) return null
+        val t = text.trim()
+        if (t.startsWith("[")) return null
+        if (!t.startsWith("{")) return "server error"
+        val o = runCatching { org.json.JSONObject(t) }.getOrNull() ?: return "server error"
+        if (o.has("subtitles") || o.has("url")) return null
+        val msg = (o.optString("message") + " " + o.optString("error")).lowercase()
+        return when {
+            msg.contains("language") || msg.contains("source") || msg.contains("restrict") ||
+                msg.contains("upgrade") || msg.contains("plan") -> "request rejected"
+            msg.contains("unauthor") || msg.contains("invalid") ||
+                msg.contains("api key") -> "key rejected"
+            msg.contains("rate") || msg.contains("limit") ||
+                msg.contains("quota") || msg.contains("top-up") ||
+                msg.contains("top up") || msg.contains("topup") -> "limit reached"
+            else -> "server error"
+        }
+    }
+
+    suspend fun fetchAndDeliver(
+        imdbId: String?,
+        season: Int,
+        episode: Int,
+        desired: Set<String>,
+        apiKey: String,
+        quiet: Boolean = false,
+        onTrack: suspend (SubtitleFile) -> Unit,
+    ): Int {
+        if (desired.isEmpty()) return 0
+        val codes = SubtilesProvider.codesFromLangs(desired)
+        if (codes.isEmpty()) return 0
+        val groups = SubtilesProvider.groupRequests(codes)
+        if (groups.isEmpty()) return 0
+        val deadline = System.currentTimeMillis() + FETCH_BUDGET_MS
+        val masked = apiKey.trim()
+        val srcEnd = minOf(deadline, System.currentTimeMillis() + SOURCES_BUDGET_MS)
+        val sources = HttpKit.attempt { keySources(apiKey, srcEnd) }
+        Log.d(TAG, "sources=${sources?.joinToString(",") ?: "default"}")
+        val results = coroutineScope {
+            groups.map { group ->
+                async {
+                    val url = buildUrl(imdbId, season, episode, group, apiKey, sources)
+                        ?: return@async GroupResult(emptyList(), null, false)
+                    Log.d(TAG, "GET ${url.replace(masked, "***")}")
+                    val (code, text) = get(url, deadline)
+                    if (text.isNullOrBlank()) return@async GroupResult(emptyList(), null, true)
+                    failureReason(code, text)?.let { return@async GroupResult(emptyList(), it, false) }
+                    GroupResult(runCatching { parse(text, group) }.getOrDefault(emptyList()), null, false)
+                }
+            }.awaitAll()
+        }
+        val seen = HashSet<String>()
+        val perLang = HashMap<String, Int>()
+        var tracks = results.flatMap { it.tracks }.filter { t ->
+            if (!seen.add(t.url)) return@filter false
+            if ((perLang[t.lang] ?: 0) >= MAX_PER_LANG) return@filter false
+            perLang[t.lang] = (perLang[t.lang] ?: 0) + 1
+            true
+        }
+        if (tracks.isEmpty()) {
+            results.mapNotNull { it.failure }.firstOrNull()?.let { reason ->
+                Log.w(TAG, "wyzie failed ($reason) - caller falls back to built-in subtitles")
+                if (!quiet) Settings.notifyWyzieFailed(reason)
+                return 0
+            }
+            if (System.currentTimeMillis() < deadline) {
+                Log.d(TAG, "empty with filter - one unfiltered retry")
+                buildUrl(imdbId, season, episode, emptySet(), apiKey, sources)?.let { retryUrl ->
+                    val (retryCode, retryText) = get(retryUrl, deadline)
+                    if (!retryText.isNullOrBlank() && failureReason(retryCode, retryText) == null) {
+                        tracks = runCatching { parse(retryText, codes) }.getOrDefault(emptyList())
+                    }
+                }
+            }
+            if (tracks.isEmpty()) {
+                if (results.all { it.blank }) {
+                    Log.w(TAG, "no reply - caller falls back to built-in subtitles")
+                    if (!quiet) Settings.notifyWyzieFailed("no reply")
+                } else {
+                    Log.d(TAG, "0 wyzie subs for $imdbId")
+                }
+                return 0
+            }
+        }
+        tracks.forEach { onTrack(SubtitleFile(it.menu, it.url)) }
+        Log.d(TAG, "${tracks.size} wyzie subs for $imdbId")
+        return tracks.size
+    }
+
+    suspend fun testKey(apiKey: String): Pair<Boolean, String> {
+        val key = apiKey.trim()
+        if (key.isEmpty()) return false to "Enter a key first"
+        val end = System.currentTimeMillis() + FETCH_BUDGET_MS
+        val sources = HttpKit.attempt { keySources(key, minOf(end, System.currentTimeMillis() + SOURCES_BUDGET_MS)) }
+        val url = buildUrl("tt1375666", 0, 0, emptySet(), key, sources)
+            ?: return false to "Enter a key first"
+        val (code, text) = get(url, end)
+        if (code == null && text.isNullOrBlank()) return false to "No reply from subtitle service"
+        failureReason(code, text)?.let { return false to "Key failed ($it)" }
+        val n = runCatching { parse(text.orEmpty(), setOf("en")) }.getOrDefault(emptyList()).size
+        return if (n > 0) true to "Key works - $n English subs found"
+        else false to "Key accepted but no subs returned"
+    }
+
+    private suspend fun get(url: String, deadline: Long): Pair<Int?, String?> {
+        val budget = deadline - System.currentTimeMillis()
+        if (budget <= 0) return null to null
+        return withTimeoutOrNull(budget) {
+            HttpKit.attempt {
+                val r = app.get(url, timeout = (budget / 1000L).coerceAtLeast(1L))
+                r.code to r.text
+            }
+        } ?: (null to null)
+    }
+}

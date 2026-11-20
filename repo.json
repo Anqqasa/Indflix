@@ -1,9 +1,1 @@
-{
-  "name": "Indflix",
-  "description": "Fast and Multi-Language Provider",
-  "manifestVersion": 1,
-  "pluginLists": [
-    "https://raw.githubusercontent.com/dipender98/Indflix/builds/plugins.json"
-  ]
-}
-
+{"description":"VidRift-first IndStream fork for SinemaKu","manifestVersion":1,"name":"VidriftStream","pluginLists":["https://raw.githubusercontent.com/Anqqasa/Indflix/builds/plugins.json"]}
