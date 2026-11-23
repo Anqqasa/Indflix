@@ -65,9 +65,9 @@ object HttpKit {
             }
             val code = app.get(url, timeout = timeoutSec, headers = headers).code
             when {
-                code == 429 -> null
+                code == 404 || code == 410 -> false
                 code in 200..399 || code == 416 -> true
-                else -> false
+                else -> null
             }
         }
     }
@@ -1176,6 +1176,10 @@ object ManifestKit {
     private val SCHEME_HOST = Regex("""^https?://[^/]+""")
     private val SCHEME_PREFIX = Regex("https?://")
     private val ATTR_RE = Regex("""([A-Za-z0-9-]+)=("([^"]*)"|[^,\s]*)""")
+
+    /** BCP-47 undetermined tag; never treated as a real language. */
+    fun isUndeterminedLanguage(value: String?): Boolean = value?.trim()?.equals("und", true) == true
+
     private val MPD_SET_RE = Regex("""<AdaptationSet\b([^>]*)>(.*?)</AdaptationSet>""", RegexOption.DOT_MATCHES_ALL)
     private val MPD_REP_RE = Regex("""<Representation\b([^>]*?)/?>""")
     private val XML_ATTR_RE = Regex("""([\w:.-]+)\s*=\s*"([^"]*)"""")
@@ -1260,8 +1264,8 @@ object ManifestKit {
         return if (variants.isEmpty() && media.isEmpty()) null
         else MasterPlaylist(
             variants = variants,
-            audio = media.filter { it.type == "AUDIO" },
-            subtitles = media.filter { it.type == "SUBTITLES" },
+            audio = media.filter { it.type.equals("AUDIO", ignoreCase = true) },
+            subtitles = media.filter { it.type.equals("SUBTITLES", ignoreCase = true) },
         )
     }
 
@@ -1361,7 +1365,7 @@ object ManifestKit {
             fun addDeclared(attrs: Map<String, String>) {
                 for (key in listOf("lang", "xml:lang")) {
                     val value = attrs[key]?.trim().orEmpty()
-                    if (value.isNotBlank() && !value.equals("und", ignoreCase = true)) declared += value
+                    if (value.isNotBlank() && !isUndeterminedLanguage(value)) declared += value
                 }
             }
             addDeclared(setAttrs)
@@ -1452,7 +1456,7 @@ object ManifestKit {
     /** First language explicitly declared by a rendition's tag or display name. */
     private fun declaredLanguageOf(rendition: MediaRendition): String? {
         val lang = rendition.language?.trim().orEmpty()
-        if (lang.isNotBlank() && !lang.equals("und", ignoreCase = true)) {
+        if (lang.isNotBlank() && !isUndeterminedLanguage(lang)) {
             // Language tags are BCP-47: the primary subtag is the language.
             LinkNaming.languageNames(lang.substringBefore('-').trim()).firstOrNull()?.let { return it }
         }
